@@ -24,12 +24,12 @@ export const route: Route = {
     },
     radar: [
         {
-            source: ['claude.com/resources/articles', 'claude.com/blog'],
+            source: ['claude.com/resources/articles'],
             target: '/blog',
         },
     ],
     name: 'Blog',
-    maintainers: ['zhenlohuang'],
+    maintainers: ['zhenlohuang', 'zj1123581321'],
     handler,
     url: 'claude.com/resources/articles',
 };
@@ -46,102 +46,74 @@ async function handler(ctx) {
         }
     }
 
-    const scopeIndex = flightData.indexOf('"scope":{"kind":"type","value":"article"');
-    if (scopeIndex === -1) {
-        throw new Error('Claude articles flight data does not contain the article scope');
-    }
-
-    const objectStart = flightData.lastIndexOf('{', scopeIndex);
-    let objectEnd = -1;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-
-    for (let index = objectStart; index < flightData.length; index++) {
-        const character = flightData[index];
-        if (inString) {
-            if (escaped) {
-                escaped = false;
-            } else if (character === '\\') {
-                escaped = true;
-            } else if (character === '"') {
-                inString = false;
-            }
-        } else if (character === '"') {
-            inString = true;
-        } else if (character === '{') {
-            depth++;
-        } else if (character === '}') {
-            depth--;
-            if (depth === 0) {
-                objectEnd = index + 1;
-                break;
-            }
-        }
-    }
-
-    if (objectEnd === -1) {
-        throw new Error('Claude articles flight data contains an unterminated article scope object');
-    }
-
-    const articleData = JSON.parse(flightData.slice(objectStart, objectEnd));
-    const articleList = articleData.curated;
-    if (articleData.scope.kind !== 'type' || articleData.scope.value !== 'article' || !Array.isArray(articleList?.items) || articleList.items.length === 0 || typeof articleList.total !== 'number') {
-        throw new Error('Claude articles flight data does not contain a non-empty article list');
-    }
-
-    const limit = ctx.req.query('limit') ? Number(ctx.req.query('limit')) : 20;
-    const posts: DataItem[] = articleList.items.slice(0, limit).map((post) => {
-        if (!post.externalUrl && !post.slug) {
-            throw new Error(`Claude article "${post.title}" has neither a slug nor an external URL`);
-        }
-
-        const category = [...new Set([post.category?.name, ...(post.products ?? []).map((product) => product.name)].filter(Boolean))];
-        const item: DataItem = {
-            title: post.title,
-            link: post.externalUrl ?? `${articlesUrl}/${post.slug}`,
-            pubDate: parseDate(post.date),
-            category,
-        };
-
-        if (!post.slug && post.externalUrl && typeof post.excerpt === 'string') {
-            item.description = post.excerpt;
-        }
-
-        return item;
-    });
-
-    const items = await pMap(
-        posts,
-        (item) => {
-            if (item.link?.startsWith(`${articlesUrl}/`) !== true) {
-                return item;
-            }
-
-            return cache.tryGet(item.link, async () => {
-                const response = await ofetch(item.link!);
-                const $ = load(response);
-                const content = $('.text-rich-text--article');
-                if (content.length === 0) {
-                    throw new Error(`Claude article page ${item.link} does not contain its article body`);
+    let articleData:
+        | {
+              curated: {
+                  items: Array<{
+                      title: string;
+                      slug: string | null;
+                      externalUrl: string | null;
+                      date: string;
+                      category?: { name?: string } | null;
+                      products?: Array<{ name: string }> | null;
+                      excerpt: string | null;
+                  }>;
+              };
+          }
+        | undefined;
+    const partRegex = /^[0-9a-z]+:[0-9a-z]*(\[.*)$/i;
+    for (const line of flightData.split('\n')) {
+        const match = partRegex.exec(line);
+        if (match && line.includes('"scope":{"kind":"type","value":"article"')) {
+            JSON.parse(match[1], (key, value) => {
+                if (value?.scope?.kind === 'type' && value.scope.value === 'article') {
+                    articleData = value as NonNullable<typeof articleData>;
                 }
-
-                content.find('svg, button, script, style').remove();
-                item.description = content.html();
-
-                const blogPosting = $('script[type="application/ld+json"]')
-                    .toArray()
-                    .map((script) => JSON.parse($(script).text()))
-                    .find((data) => data['@type'] === 'BlogPosting');
-                if (blogPosting?.author) {
-                    item.author = blogPosting.author.map((author) => ({ name: author.name }));
-                }
-                if (blogPosting?.datePublished) {
-                    item.pubDate = parseDate(blogPosting.datePublished);
-                }
-
-                return item;
+                return value;
             });
+        }
+    }
+
+    const articleList = articleData!.curated;
+    const limit = ctx.req.query('limit') ? Number(ctx.req.query('limit')) : 15;
+    const items = await pMap(
+        articleList.items.slice(0, limit),
+        (post) => {
+            const category = [...new Set([post.category?.name, ...(post.products ?? []).map((product) => product.name)].filter((name): name is string => Boolean(name)))];
+            const item: DataItem = {
+                title: post.title,
+                link: post.externalUrl ?? `${articlesUrl}/${post.slug}`,
+                pubDate: parseDate(post.date),
+                category,
+            };
+
+            if (post.slug) {
+                return cache.tryGet(item.link!, async () => {
+                    const response = await ofetch(item.link!);
+                    const $ = load(response);
+                    const content = $('.text-rich-text--article');
+                    content.find('svg, button, script, style').remove();
+                    item.description = content.html();
+
+                    const blogPosting = $('script[type="application/ld+json"]')
+                        .toArray()
+                        .map((script) => JSON.parse($(script).text()))
+                        .find((data) => data['@type'] === 'BlogPosting');
+                    if (blogPosting?.author) {
+                        item.author = blogPosting.author.map((author) => ({ name: author.name }));
+                    }
+                    if (blogPosting?.datePublished) {
+                        item.pubDate = parseDate(blogPosting.datePublished);
+                    }
+
+                    return item;
+                });
+            }
+
+            if (post.excerpt !== null) {
+                item.description = post.excerpt;
+            }
+            return item;
         },
         { concurrency: 3 }
     );
