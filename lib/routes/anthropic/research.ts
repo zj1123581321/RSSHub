@@ -67,7 +67,10 @@ async function handler(ctx) {
             };
         });
 
-    const sections = fd.flatMap((d) => (Array.isArray(d.data) ? d.data : [])).flatMap((item) => item?.page?.sections ?? []);
+    const sections = fd
+        .flatMap((d) => (Array.isArray(d.data) ? d.data : []))
+        .flatMap((item) => (Array.isArray(item?.children) ? item.children : []))
+        .flatMap((item) => (Array.isArray(item?.[3]?.page?.sections) ? item[3].page.sections : []));
     const publicationSections = sections.filter((section) => section?.title === 'Publications');
     const posts = publicationSections
         .flatMap((section) => section?.posts ?? [])
